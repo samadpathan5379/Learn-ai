@@ -11,12 +11,47 @@ from keep_alive import keep_alive
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# --- GEMINI SETUP ---
+# --- AUTO-DISCOVERY SETUP ---
 genai.configure(api_key=GEMINI_API_KEY)
 
-# We use 'gemini-1.5-flash' because it is the standard, stable model now.
-# If this fails, the only fix is updating requirements.txt, but this code is the correct one.
-model = genai.GenerativeModel('gemini-1.5-flash')
+def find_best_model():
+    print("🔍 Scanning your API Key for available models...")
+    try:
+        # Get all models that support "generateContent" (Chatting)
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        
+        print(f"📋 Google says you can use: {available_models}")
+        
+        # Priority Logic: Pick the best one from the list
+        # 1. Try to find 'flash' (Fastest)
+        for model_name in available_models:
+            if "flash" in model_name and "latest" not in model_name:
+                print(f"✅ Auto-Selected: {model_name}")
+                return genai.GenerativeModel(model_name)
+        
+        # 2. If no Flash, try 'pro' (Standard)
+        for model_name in available_models:
+            if "pro" in model_name and "vision" not in model_name:
+                print(f"✅ Auto-Selected: {model_name}")
+                return genai.GenerativeModel(model_name)
+
+        # 3. If neither, just take the FIRST one that works
+        if available_models:
+            print(f"⚠️ specific preference not found. Using: {available_models[0]}")
+            return genai.GenerativeModel(available_models[0])
+            
+    except Exception as e:
+        print(f"❌ Error scanning models: {e}")
+    
+    # 4. Final Safety Net (Hardcoded fallback)
+    print("⚠️ Fallback to generic 'gemini-pro'")
+    return genai.GenerativeModel('gemini-pro')
+
+# LOAD THE DETECTED MODEL
+model = find_best_model()
 
 # --- DISCORD SETUP ---
 intents = discord.Intents.default()
@@ -35,7 +70,7 @@ async def send_smart(ctx, text):
 
 @bot.event
 async def on_ready():
-    print(f'⚡ CONNECTED: {bot.user}')
+    print(f'⚡ CONNECTED AS: {bot.user}')
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="$help"))
 
 @bot.command(name="help")
@@ -52,13 +87,18 @@ async def ping(ctx):
 
 @bot.command(name="status")
 async def status(ctx):
-    await ctx.send(f"🟢 **Online** | Brain: `Gemini 1.5 Flash`")
+    try:
+        # Shows exactly which model was auto-selected
+        name = model.model_name
+    except:
+        name = "Unknown"
+    await ctx.send(f"🟢 **Online** | Auto-Selected Brain: `{name}`")
 
 @bot.command(name="ask")
 async def ask(ctx, *, prompt: str = ""):
     async with ctx.typing():
         try:
-            # Handle Image Attachment
+            # Handle Image
             if ctx.message.attachments:
                 att = ctx.message.attachments[0]
                 if att.content_type.startswith('image/'):
@@ -92,34 +132,25 @@ async def imagine(ctx, *, prompt: str):
         except Exception as e:
             await ctx.send(f"❌ Image Error: {e}")
 
-# --- NEW COMMANDS ---
+# --- NEW FEATURES ---
 @bot.command(name="explain")
 async def explain(ctx, *, topic: str):
     async with ctx.typing():
-        try:
-            resp = model.generate_content(f"Explain '{topic}' simply in 2-3 sentences.")
-            await send_smart(ctx, f"🎓 **{topic}:**\n{resp.text}")
-        except Exception as e:
-            await ctx.send(f"⚠️ Error: {e}")
+        resp = model.generate_content(f"Explain '{topic}' simply in 2 sentences.")
+        await send_smart(ctx, f"🎓 **{topic}:**\n{resp.text}")
 
 @bot.command(name="summary")
 async def summary(ctx, *, text: str):
     async with ctx.typing():
-        try:
-            resp = model.generate_content(f"Summarize this in bullet points:\n{text}")
-            await send_smart(ctx, resp.text)
-        except Exception as e:
-            await ctx.send(f"⚠️ Error: {e}")
+        resp = model.generate_content(f"Summarize this in bullet points:\n{text}")
+        await send_smart(ctx, resp.text)
 
 @bot.command(name="roast")
 async def roast(ctx, member: discord.Member = None):
     target = member if member else ctx.author
     async with ctx.typing():
-        try:
-            resp = model.generate_content(f"Write a short, funny, friendly roast for {target.name}.")
-            await ctx.send(f"🔥 {target.mention} {resp.text}")
-        except Exception as e:
-            await ctx.send(f"⚠️ Error: {e}")
+        resp = model.generate_content(f"Write a short, funny, friendly roast for {target.name}.")
+        await ctx.send(f"🔥 {target.mention} {resp.text}")
 
 # --- ADMIN COMMANDS ---
 @bot.command(name="setchannel")
