@@ -5,27 +5,42 @@ import os
 import aiohttp
 import json
 import random
+import urllib.parse
 from keep_alive import keep_alive
 
 # --- CONFIGURATION ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-SETTINGS_FILE = "settings.json"
 
-# --- SETUP GEMINI (Optimized for SPEED) ---
+# --- SETUP GEMINI (FAST & UNFILTERED) ---
 genai.configure(api_key=GEMINI_API_KEY)
 
-# We set a "System Instruction" here. 
-# This tells the bot to ALWAYS be concise and direct.
+# 1. SYSTEM PROMPT: Forces brevity and directness.
 SYSTEM_PROMPT = "You are a helpful assistant. Give concise, direct, and detailed answers. Avoid filler words. Be precise."
+
+# 2. SAFETY SETTINGS: Disables filters to prevent blocked responses.
+# WE ARE TURNING OFF THE SAFETY FILTERS SO IT ANSWERS EVERYTHING.
+safety_settings = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
 
 def get_model():
     try:
-        # We force 'flash' because it is the fastest model available
-        return genai.GenerativeModel('gemini-1.5-flash', system_instruction=SYSTEM_PROMPT)
+        # Use Flash for speed, with system prompt and NO safety filters.
+        return genai.GenerativeModel(
+            'gemini-1.5-flash',
+            system_instruction=SYSTEM_PROMPT,
+            safety_settings=safety_settings
+        )
     except:
-        # Fallback if Flash fails
-        return genai.GenerativeModel('gemini-pro')
+        # Fallback to Pro if Flash has a hiccup
+        return genai.GenerativeModel(
+            'gemini-pro',
+            safety_settings=safety_settings
+        )
 
 model = get_model()
 bot_settings = {}
@@ -33,6 +48,7 @@ bot_settings = {}
 # --- SETUP DISCORD ---
 intents = discord.Intents.default()
 intents.message_content = True
+# 🔴 STRICT PREFIX: Only '$' works.
 bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)
 
 # --- HELPER FUNCTIONS ---
@@ -56,8 +72,9 @@ async def log_usage(ctx, command, content):
 # --- EVENTS ---
 @bot.event
 async def on_ready():
-    print(f'⚡ Fast Bot Logged in as {bot.user}')
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="$help"))
+    # This print confirms only ONE bot is running.
+    print(f'⚡ SINGLE INSTANCE: Logged in as {bot.user}')
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="$help | Speed Mode"))
 
 # --- COMMANDS ---
 @bot.command(name="help")
@@ -70,11 +87,12 @@ async def help_cmd(ctx):
 
 @bot.command(name="ping")
 async def ping(ctx):
+    # If you see two replies to this, you still have two bots running.
     await ctx.send(f"⚡ Speed: `{round(bot.latency * 1000)}ms`")
 
 @bot.command(name="status")
 async def status(ctx):
-    await ctx.send(f"🟢 **Online** | Brain: `Gemini Flash 1.5` (Optimized)")
+    await ctx.send(f"🟢 **Online** | Brain: `Gemini Flash 1.5` (Unfiltered)")
 
 # --- FAST AI COMMANDS ---
 @bot.command(name="ask")
@@ -83,34 +101,32 @@ async def ask(ctx, *, prompt: str = ""):
 
     async with ctx.typing():
         try:
-            # Image Analysis
             if ctx.message.attachments:
                 attachment = ctx.message.attachments[0]
                 if not attachment.content_type.startswith('image/'):
                     await ctx.send("❌ Image only.")
                     return
-                
                 async with aiohttp.ClientSession() as session:
                     async with session.get(attachment.url) as resp:
                         image_data = await resp.read()
                         content = [{"mime_type": attachment.content_type, "data": image_data}, prompt if prompt else "Analyze this."]
                         response = model.generate_content(content)
                         await ctx.send(response.text[:2000])
-            # Text Analysis
             else:
                 if not prompt: await ctx.send("Usage: `$ask [question]`"); return
+                # Generate with NO safety filters
                 response = model.generate_content(prompt)
                 await ctx.send(response.text[:2000])
             
             await log_usage(ctx, "ask", prompt)
         except Exception as e:
-            await ctx.send(f"⚠️ Error: {e}")
+            # If an error still happens, print it clearly.
+            await ctx.send(f"⚠️ AI Error: {e}")
 
 @bot.command(name="explain")
 async def explain(ctx, *, topic: str):
     if not await check_channel(ctx): return
     async with ctx.typing():
-        # Instructions specifically for brevity
         response = model.generate_content(f"Explain '{topic}' in 2-3 short sentences. Be simple.")
         await ctx.send(f"🎓 **{topic}:**\n{response.text}")
 
@@ -121,30 +137,29 @@ async def summary(ctx, *, text: str):
         response = model.generate_content(f"Summarize this in 3 bullet points:\n{text}")
         await ctx.send(f"📝 **Summary:**\n{response.text}")
 
-# --- ROBUST IMAGE GENERATION (Fixes Long Prompts) ---
+# --- ROBUST IMAGE GENERATION ---
 @bot.command(name="imagine")
 async def imagine(ctx, *, prompt: str):
     if not await check_channel(ctx): return
 
     async with ctx.typing():
         try:
-            # 1. We encode the prompt safely to handle special characters and length
-            import urllib.parse
+            # 1. URL Encode the prompt to handle long text/symbols
             clean_prompt = urllib.parse.quote(prompt)
-            
-            # 2. We use a seed to make it deterministic (faster caching)
+            # 2. Add a random seed to prevent caching same results
             seed = random.randint(1, 99999)
+            # 3. Use a robust model (flux)
             url = f"https://image.pollinations.ai/prompt/{clean_prompt}?width=1024&height=1024&nologo=true&seed={seed}&model=flux"
             
             embed = discord.Embed(title=f"🎨 Generated", color=discord.Color.purple())
             embed.set_image(url=url)
-            embed.set_footer(text=f"Prompt: {prompt[:50]}...") # Show simplified footer
+            embed.set_footer(text=f"Prompt: {prompt[:50]}...")
             
             await ctx.send(embed=embed)
             await log_usage(ctx, "imagine", prompt)
 
         except Exception as e:
-            await ctx.send(f"❌ Failed: {e}")
+            await ctx.send(f"❌ Image Failed: {e}")
 
 # --- ADMIN ---
 @bot.command(name="setchannel")
