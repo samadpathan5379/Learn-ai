@@ -1,8 +1,8 @@
 import discord
 from discord.ext import commands
-import google.generativeai as genai
 import os
 import aiohttp
+import json
 import random
 import urllib.parse
 from keep_alive import keep_alive
@@ -11,54 +11,61 @@ from keep_alive import keep_alive
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# --- AUTO-DISCOVERY SETUP ---
-genai.configure(api_key=GEMINI_API_KEY)
-
-def find_best_model():
-    print("🔍 Scanning your API Key for available models...")
-    try:
-        # Get all models that support "generateContent" (Chatting)
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
-        
-        print(f"📋 Google says you can use: {available_models}")
-        
-        # Priority Logic: Pick the best one from the list
-        # 1. Try to find 'flash' (Fastest)
-        for model_name in available_models:
-            if "flash" in model_name and "latest" not in model_name:
-                print(f"✅ Auto-Selected: {model_name}")
-                return genai.GenerativeModel(model_name)
-        
-        # 2. If no Flash, try 'pro' (Standard)
-        for model_name in available_models:
-            if "pro" in model_name and "vision" not in model_name:
-                print(f"✅ Auto-Selected: {model_name}")
-                return genai.GenerativeModel(model_name)
-
-        # 3. If neither, just take the FIRST one that works
-        if available_models:
-            print(f"⚠️ specific preference not found. Using: {available_models[0]}")
-            return genai.GenerativeModel(available_models[0])
-            
-    except Exception as e:
-        print(f"❌ Error scanning models: {e}")
-    
-    # 4. Final Safety Net (Hardcoded fallback)
-    print("⚠️ Fallback to generic 'gemini-pro'")
-    return genai.GenerativeModel('gemini-pro')
-
-# LOAD THE DETECTED MODEL
-model = find_best_model()
-
 # --- DISCORD SETUP ---
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)
 
-# --- HELPER: Split Long Messages ---
+# --- HELPER: MANUAL API CALL (Bypasses Library) ---
+async def ask_google_manual(prompt, image_url=None, system_instruction=None):
+    # We use the REST API directly to avoid library errors
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    headers = {"Content-Type": "application/json"}
+    
+    # 1. Base Payload
+    data = {
+        "contents": [],
+        # This tells the AI how to behave (Short answers, etc.)
+        "system_instruction": {
+            "parts": {"text": system_instruction or "You are a helpful assistant. Keep answers concise, direct, and short. Do not waffle."}
+        }
+    }
+
+    # 2. Add User Content (Image vs Text)
+    if image_url:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as resp:
+                if resp.status != 200: return "Error downloading image."
+                img_data = await resp.read()
+                import base64
+                b64_image = base64.b64encode(img_data).decode('utf-8')
+                
+                data["contents"].append({
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": "image/jpeg", "data": b64_image}}
+                    ]
+                })
+    else:
+        data["contents"].append({
+            "parts": [{"text": prompt}]
+        })
+
+    # 3. Send Request
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=data) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                return f"⚠️ API Error ({response.status}): {error_text}"
+            
+            result = await response.json()
+            try:
+                return result['candidates'][0]['content']['parts'][0]['text']
+            except:
+                return "⚠️ Error: No text returned."
+
+# --- HELPER: MESSAGE SPLITTER ---
 async def send_smart(ctx, text):
     if len(text) <= 2000:
         await ctx.send(text)
@@ -70,15 +77,14 @@ async def send_smart(ctx, text):
 
 @bot.event
 async def on_ready():
-    print(f'⚡ CONNECTED AS: {bot.user}')
+    print(f'⚡ CONNECTED (MANUAL MODE): {bot.user}')
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="$help"))
 
 @bot.command(name="help")
 async def help_cmd(ctx):
     embed = discord.Embed(title="🤖 Bot Menu", color=0x00ff00)
-    embed.add_field(name="AI", value="`$ask [q]` - Chat\n`$explain` - Simple\n`$summary` - Shorten", inline=False)
-    embed.add_field(name="Fun", value="`$imagine` - Create Image\n`$roast` - Roast User", inline=False)
-    embed.add_field(name="System", value="`$ping` - Speed\n`$status` - Brain Info", inline=False)
+    embed.add_field(name="AI", value="`$ask`\n`$explain`\n`$summary`", inline=False)
+    embed.add_field(name="Fun", value="`$imagine`\n`$roast`", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command(name="ping")
@@ -87,38 +93,32 @@ async def ping(ctx):
 
 @bot.command(name="status")
 async def status(ctx):
-    try:
-        # Shows exactly which model was auto-selected
-        name = model.model_name
-    except:
-        name = "Unknown"
-    await ctx.send(f"🟢 **Online** | Auto-Selected Brain: `{name}`")
+    await ctx.send(f"🟢 **Online** | Mode: `Direct REST API`")
 
 @bot.command(name="ask")
 async def ask(ctx, *, prompt: str = ""):
     async with ctx.typing():
-        try:
-            # Handle Image
-            if ctx.message.attachments:
-                att = ctx.message.attachments[0]
-                if att.content_type.startswith('image/'):
-                    async with aiohttp.ClientSession() as sess:
-                        async with sess.get(att.url) as resp:
-                            img_data = await resp.read()
-                            content = [{"mime_type": att.content_type, "data": img_data}, prompt if prompt else "Analyze"]
-                            response = model.generate_content(content)
-                            await send_smart(ctx, response.text)
-            # Handle Text
-            elif prompt:
-                response = model.generate_content(prompt)
-                await send_smart(ctx, response.text)
-            else:
-                await ctx.send("Usage: `$ask [question]`")
-        except Exception as e:
-            await ctx.send(f"⚠️ Error: {e}")
+        image_url = None
+        if ctx.message.attachments:
+            if ctx.message.attachments[0].content_type.startswith('image/'):
+                image_url = ctx.message.attachments[0].url
+        
+        if not prompt and not image_url:
+            await ctx.send("Usage: `$ask [question]`")
+            return
+
+        # System prompt ensures concise answers
+        answer = await ask_google_manual(
+            prompt if prompt else "Analyze this", 
+            image_url,
+            system_instruction="You are a helpful assistant. Give concise, to-the-point answers. Do not write long paragraphs unless necessary."
+        )
+        await send_smart(ctx, answer)
 
 @bot.command(name="imagine")
 async def imagine(ctx, *, prompt: str):
+    # Added feedback so you know it's working
+    msg = await ctx.send(f"🎨 Generating image for `{prompt}`...")
     async with ctx.typing():
         try:
             clean_prompt = urllib.parse.quote(prompt)
@@ -127,30 +127,40 @@ async def imagine(ctx, *, prompt: str):
             
             embed = discord.Embed(title="🎨 Generated Image", color=discord.Color.purple())
             embed.set_image(url=url)
-            embed.set_footer(text=f"Prompt: {prompt[:50]}...")
+            
+            # Delete the "Generating..." message and show the result
+            await msg.delete()
             await ctx.send(embed=embed)
         except Exception as e:
-            await ctx.send(f"❌ Image Error: {e}")
+            await msg.edit(content=f"❌ Image Error: {e}")
 
-# --- NEW FEATURES ---
 @bot.command(name="explain")
 async def explain(ctx, *, topic: str):
     async with ctx.typing():
-        resp = model.generate_content(f"Explain '{topic}' simply in 2 sentences.")
-        await send_smart(ctx, f"🎓 **{topic}:**\n{resp.text}")
+        answer = await ask_google_manual(
+            f"Explain '{topic}'", 
+            system_instruction="Explain this topic simply and clearly in 2-3 short sentences."
+        )
+        await send_smart(ctx, f"🎓 **{topic}:**\n{answer}")
 
 @bot.command(name="summary")
 async def summary(ctx, *, text: str):
     async with ctx.typing():
-        resp = model.generate_content(f"Summarize this in bullet points:\n{text}")
-        await send_smart(ctx, resp.text)
+        answer = await ask_google_manual(
+            f"Summarize this:\n{text}",
+            system_instruction="Summarize the text into 3 short bullet points."
+        )
+        await send_smart(ctx, answer)
 
 @bot.command(name="roast")
 async def roast(ctx, member: discord.Member = None):
     target = member if member else ctx.author
     async with ctx.typing():
-        resp = model.generate_content(f"Write a short, funny, friendly roast for {target.name}.")
-        await ctx.send(f"🔥 {target.mention} {resp.text}")
+        answer = await ask_google_manual(
+            f"Roast {target.name}",
+            system_instruction="You are a savage comedian. Write ONE single, short, funny, and savage line to roast the user. Do not write a list."
+        )
+        await ctx.send(f"🔥 {target.mention} {answer}")
 
 # --- ADMIN COMMANDS ---
 @bot.command(name="setchannel")
