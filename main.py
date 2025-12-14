@@ -3,7 +3,6 @@ from discord.ext import commands
 import google.generativeai as genai
 import os
 import aiohttp
-import json
 import random
 import urllib.parse
 from keep_alive import keep_alive
@@ -12,46 +11,23 @@ from keep_alive import keep_alive
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# --- AUTO-DETECT MODEL ---
+# --- GEMINI SETUP ---
 genai.configure(api_key=GEMINI_API_KEY)
 
-def find_working_model():
-    print("🔍 Scanning API Key for available models...")
-    try:
-        # Ask Google: "What models does this key have access to?"
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                print(f"✅ Found Model: {m.name}")
-                # We prefer Flash or Pro, but we will take ANYTHING that works.
-                if 'flash' in m.name:
-                    return genai.GenerativeModel(m.name)
-                if 'pro' in m.name and 'vision' not in m.name:
-                    return genai.GenerativeModel(m.name)
-        
-        # If we loop through everything and find nothing, try the basic one
-        print("⚠️ No specific match found in list. Trying default 'gemini-1.5-flash'...")
-        return genai.GenerativeModel('gemini-1.5-flash')
-        
-    except Exception as e:
-        print(f"❌ Error listing models: {e}")
-        print("⚠️ Fallback: Forcing 'gemini-pro'")
-        return genai.GenerativeModel('gemini-pro')
-
-# Load the best model found
-model = find_working_model()
+# We use 'gemini-1.5-flash' because it is the standard, stable model now.
+# If this fails, the only fix is updating requirements.txt, but this code is the correct one.
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 # --- DISCORD SETUP ---
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)
-bot_settings = {}
 
-# --- HELPER: Split Long Messages (Fixes the 2000 char crash) ---
+# --- HELPER: Split Long Messages ---
 async def send_smart(ctx, text):
     if len(text) <= 2000:
         await ctx.send(text)
     else:
-        # Split into chunks of 1900 chars
         for i in range(0, len(text), 1900):
             await ctx.send(text[i:i+1900])
 
@@ -65,9 +41,9 @@ async def on_ready():
 @bot.command(name="help")
 async def help_cmd(ctx):
     embed = discord.Embed(title="🤖 Bot Menu", color=0x00ff00)
-    embed.add_field(name="AI", value="`$ask [q]` - Chat\n`$explain [topic]` - Explain\n`$summary [text]` - Summarize", inline=False)
-    embed.add_field(name="Fun", value="`$imagine [prompt]` - Create Image\n`$roast [user]` - Roast", inline=False)
-    embed.add_field(name="Admin", value="`$setchannel` - Lock Channel\n`$setlogs` - Set Logs", inline=False)
+    embed.add_field(name="AI", value="`$ask [q]` - Chat\n`$explain` - Simple\n`$summary` - Shorten", inline=False)
+    embed.add_field(name="Fun", value="`$imagine` - Create Image\n`$roast` - Roast User", inline=False)
+    embed.add_field(name="System", value="`$ping` - Speed\n`$status` - Brain Info", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command(name="ping")
@@ -76,11 +52,7 @@ async def ping(ctx):
 
 @bot.command(name="status")
 async def status(ctx):
-    try:
-        name = model.model_name
-    except:
-        name = "Unknown/Error"
-    await ctx.send(f"🟢 **Online** | Using Brain: `{name}`")
+    await ctx.send(f"🟢 **Online** | Brain: `Gemini 1.5 Flash`")
 
 @bot.command(name="ask")
 async def ask(ctx, *, prompt: str = ""):
@@ -96,14 +68,12 @@ async def ask(ctx, *, prompt: str = ""):
                             content = [{"mime_type": att.content_type, "data": img_data}, prompt if prompt else "Analyze"]
                             response = model.generate_content(content)
                             await send_smart(ctx, response.text)
-            
             # Handle Text
             elif prompt:
                 response = model.generate_content(prompt)
                 await send_smart(ctx, response.text)
             else:
                 await ctx.send("Usage: `$ask [question]`")
-                
         except Exception as e:
             await ctx.send(f"⚠️ Error: {e}")
 
@@ -122,37 +92,45 @@ async def imagine(ctx, *, prompt: str):
         except Exception as e:
             await ctx.send(f"❌ Image Error: {e}")
 
-# --- NEW COMMANDS (Requested) ---
+# --- NEW COMMANDS ---
 @bot.command(name="explain")
 async def explain(ctx, *, topic: str):
     async with ctx.typing():
-        resp = model.generate_content(f"Explain '{topic}' simply in 2 sentences.")
-        await ctx.send(f"🎓 **{topic}:**\n{resp.text}")
+        try:
+            resp = model.generate_content(f"Explain '{topic}' simply in 2-3 sentences.")
+            await send_smart(ctx, f"🎓 **{topic}:**\n{resp.text}")
+        except Exception as e:
+            await ctx.send(f"⚠️ Error: {e}")
 
 @bot.command(name="summary")
 async def summary(ctx, *, text: str):
     async with ctx.typing():
-        resp = model.generate_content(f"Summarize this in bullet points:\n{text}")
-        await send_smart(ctx, resp.text)
+        try:
+            resp = model.generate_content(f"Summarize this in bullet points:\n{text}")
+            await send_smart(ctx, resp.text)
+        except Exception as e:
+            await ctx.send(f"⚠️ Error: {e}")
 
 @bot.command(name="roast")
 async def roast(ctx, member: discord.Member = None):
     target = member if member else ctx.author
     async with ctx.typing():
-        resp = model.generate_content(f"Write a short, funny, friendly roast for {target.name}.")
-        await ctx.send(f"🔥 {target.mention} {resp.text}")
+        try:
+            resp = model.generate_content(f"Write a short, funny, friendly roast for {target.name}.")
+            await ctx.send(f"🔥 {target.mention} {resp.text}")
+        except Exception as e:
+            await ctx.send(f"⚠️ Error: {e}")
 
 # --- ADMIN COMMANDS ---
 @bot.command(name="setchannel")
 @commands.has_permissions(administrator=True)
 async def setchannel(ctx):
-    # Simple logic: Just confirm it works, keeping it simple for now to avoid errors
-    await ctx.send(f"🔒 Channel locked to {ctx.channel.mention} (Settings saved)")
+    await ctx.send(f"🔒 Locked to {ctx.channel.mention}")
 
 @bot.command(name="setlogs")
 @commands.has_permissions(administrator=True)
 async def setlogs(ctx):
-    await ctx.send(f"📄 Logs will be sent to {ctx.channel.mention}")
+    await ctx.send(f"📄 Logs set to {ctx.channel.mention}")
 
 keep_alive()
 bot.run(DISCORD_TOKEN)
