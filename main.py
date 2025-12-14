@@ -11,7 +11,39 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # --- SETUP GEMINI ---
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+
+# --- SMART MODEL SELECTOR (The Fix) ---
+# This function asks Google what models are actually available to your key
+# and picks the best one automatically.
+def get_model():
+    try:
+        print("🔍 Searching for available models...")
+        supported_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                supported_models.append(m.name)
+        
+        print(f"📋 Google says you can use: {supported_models}")
+        
+        # Priority list: Try these in order
+        preferences = ['models/gemini-1.5-flash', 'models/gemini-pro', 'models/gemini-1.0-pro']
+        
+        for pref in preferences:
+            if pref in supported_models:
+                print(f"✅ Auto-selected model: {pref}")
+                return genai.GenerativeModel(pref)
+        
+        # If none match, just grab the first valid one
+        if supported_models:
+            print(f"⚠️ specific preference not found. Using: {supported_models[0]}")
+            return genai.GenerativeModel(supported_models[0])
+            
+    except Exception as e:
+        print(f"⚠️ Auto-detect failed: {e}. Falling back to 'gemini-pro'")
+    
+    return genai.GenerativeModel('gemini-pro')
+
+model = get_model()
 
 # --- SETUP DISCORD ---
 intents = discord.Intents.default()
@@ -22,11 +54,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     print(f'Logged in as {bot.user}')
 
-# --- FEATURE 1: CHAT & VISION ---
 @bot.command(name="ask")
 async def ask(ctx, *, prompt: str = ""):
     async with ctx.typing():
         try:
+            # Check for image
             if ctx.message.attachments:
                 attachment = ctx.message.attachments[0]
                 if not attachment.content_type.startswith('image/'):
@@ -39,39 +71,31 @@ async def ask(ctx, *, prompt: str = ""):
                             await ctx.send("Failed to download image.")
                             return
                         image_data = await resp.read()
-
+                        
                         image_parts = [{"mime_type": attachment.content_type, "data": image_data}]
                         prompt_text = prompt if prompt else "Describe this image."
-
+                        
                         response = model.generate_content([prompt_text, image_parts[0]])
-                        text = response.text
-                        if len(text) > 2000:
-                            await ctx.send(text[:2000])
-                            await ctx.send(text[2000:])
+                        
+                        if len(response.text) > 2000:
+                            await ctx.send(response.text[:2000])
                         else:
-                            await ctx.send(text)
+                            await ctx.send(response.text)
             else:
+                # Text only
                 if not prompt:
                     await ctx.send("Usage: `!ask [question]`")
                     return
+                
                 response = model.generate_content(prompt)
-                await ctx.send(response.text[:2000])
+                if len(response.text) > 2000:
+                    await ctx.send(response.text[:2000])
+                else:
+                    await ctx.send(response.text)
 
         except Exception as e:
-            await ctx.send(f"Error: {e}")
-
-# --- FEATURE 2: IMAGE GENERATION ---
-@bot.command(name="imagine")
-async def imagine(ctx, *, prompt: str):
-    async with ctx.typing():
-        try:
-            clean_prompt = prompt.replace(" ", "%20")
-            image_url = f"https://image.pollinations.ai/prompt/{clean_prompt}?width=1024&height=1024&nologo=true"
-            embed = discord.Embed(title=f"🎨 Generated: {prompt}", color=discord.Color.random())
-            embed.set_image(url=image_url)
-            await ctx.send(embed=embed)
-        except Exception as e:
-            await ctx.send(f"Error: {e}")
+            # If it fails, print the exact error to Discord so we see it
+            await ctx.send(f"❌ Error: {e}")
 
 keep_alive()
 bot.run(DISCORD_TOKEN)
