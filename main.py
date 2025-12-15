@@ -15,10 +15,17 @@ KEY_RETRY_AFTER = 25
 
 DAILY_LIMIT = 20
 MEMORY_SIZE = 8
+USER_COOLDOWN = 10  # seconds
 
 AI_CHANNEL_ID = None
+
 USER_USAGE = {}
 USER_MEMORY = {}
+USER_LAST_CALL = {}
+
+# Analytics
+TOTAL_REQUESTS = 0
+UNIQUE_USERS = set()
 
 MODEL = "llama-3.1-8b-instant"
 
@@ -27,11 +34,39 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)
 
+# ================== SMART ANSWER LOGIC ==================
+def get_response_style(prompt: str) -> str:
+    """
+    Decide how long / detailed the answer should be
+    """
+    text = prompt.lower().strip()
+    words = len(text.split())
+
+    if words <= 3:
+        return "Reply in one very short sentence or phrase."
+
+    if text.startswith(("what is", "who is", "when", "where", "define")):
+        return "Reply in 1–2 short sentences. Be factual."
+
+    if text.startswith(("how", "why", "explain")):
+        return "Explain clearly in 4–6 sentences. Stay focused."
+
+    return "Answer clearly and accurately. Avoid unnecessary detail."
+
 # ================== AI CORE ==================
-def ask_ai(user_id, prompt, image_url=None, system=None):
-    global CURRENT_KEY_INDEX
+def ask_ai(user_id, prompt, image_url=None):
+    global CURRENT_KEY_INDEX, TOTAL_REQUESTS
+
     now = time.time()
 
+    # ---- Per-user cooldown ----
+    last = USER_LAST_CALL.get(user_id, 0)
+    if now - last < USER_COOLDOWN:
+        return f"⏳ Please wait `{int(USER_COOLDOWN - (now-last))}s` before asking again."
+
+    USER_LAST_CALL[user_id] = now
+
+    # ---- Daily limit ----
     usage = USER_USAGE.setdefault(user_id, {"count": 0, "time": now})
     if now - usage["time"] > 86400:
         USER_USAGE[user_id] = {"count": 0, "time": now}
@@ -41,9 +76,16 @@ def ask_ai(user_id, prompt, image_url=None, system=None):
 
     USER_USAGE[user_id]["count"] += 1
 
+    # ---- Analytics ----
+    TOTAL_REQUESTS += 1
+    UNIQUE_USERS.add(user_id)
+
+    # ---- Memory ----
     memory = USER_MEMORY.setdefault(user_id, [])
     memory.append({"role": "user", "content": prompt})
     memory[:] = memory[-MEMORY_SIZE:]
+
+    style_instruction = get_response_style(prompt)
 
     attempts = 0
     while attempts < len(ALL_KEYS):
@@ -55,7 +97,18 @@ def ask_ai(user_id, prompt, image_url=None, system=None):
 
         try:
             client = Groq(api_key=key)
-            messages = [{"role": "system", "content": system or "Be clear, concise, and helpful."}] + memory
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise AI assistant.\n"
+                        "Answer exactly what is asked.\n"
+                        f"{style_instruction}\n"
+                        "Do not add extra information or summaries unless asked."
+                    )
+                }
+            ] + memory
 
             if image_url:
                 img = base64.b64encode(requests.get(image_url).content).decode()
@@ -67,8 +120,9 @@ def ask_ai(user_id, prompt, image_url=None, system=None):
             res = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
-                max_tokens=300
+                max_tokens=200
             )
+
             reply = res.choices[0].message.content
             memory.append({"role": "assistant", "content": reply})
             return reply
@@ -78,14 +132,19 @@ def ask_ai(user_id, prompt, image_url=None, system=None):
             CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(ALL_KEYS)
             attempts += 1
 
-    return "⏳ **AI is busy. Please try again shortly.**"
+    return "⏳ AI is busy. Please try again shortly."
+
+# ================== EVENTS ==================
+@bot.event
+async def on_ready():
+    print(f"⚡ Connected as {bot.user}")
 
 # ================== HELP ==================
 @bot.command()
 async def help(ctx):
     embed = discord.Embed(
         title="🤖 Learn AI – Commands",
-        description="Your smart AI assistant for chat, translation, and writing.",
+        description="Smart AI assistant with precise answers.",
         color=0x00C2FF
     )
     embed.add_field(
@@ -93,21 +152,22 @@ async def help(ctx):
         value=(
             "`$ask <question>` – Ask anything (supports images)\n"
             "`$translate <text>` – Translate between any languages\n"
-            "`$rewrite <text>` – Rewrite text professionally\n"
-            "`$fixgrammar <text>` – Fix grammar & clarity"
+            "`$rewrite <text>` – Rewrite professionally\n"
+            "`$fixgrammar <text>` – Fix grammar & clarity\n"
+            "`$clearcontext` – Clear your AI memory"
         ),
         inline=False
     )
     embed.add_field(
         name="📊 Info",
-        value="`$usage` – View daily AI usage\n`$status` – Bot system status\n`$ping` – Bot latency",
+        value="`$usage` – Your daily usage\n`$status` – Bot status\n`$ping` – Latency",
         inline=False
     )
 
     if ctx.author.guild_permissions.administrator:
         embed.add_field(
             name="🔐 Admin",
-            value="`$setaichannel #channel` – Restrict AI to one channel",
+            value="`$setaichannel #channel`\n`$analytics`",
             inline=False
         )
 
@@ -119,9 +179,10 @@ async def status(ctx):
     embed = discord.Embed(title="🟢 Learn AI Status", color=0x2ECC71)
     embed.add_field(name="🧠 Memory", value=f"{MEMORY_SIZE} messages", inline=True)
     embed.add_field(name="📍 AI Channel", value="Not set" if not AI_CHANNEL_ID else f"<#{AI_CHANNEL_ID}>", inline=True)
-    embed.add_field(name="⚡ Model", value="llama-3.1-8b-instant", inline=True)
+    embed.add_field(name="⚡ Model", value=MODEL, inline=True)
     embed.add_field(name="🔑 API Keys", value=str(len(ALL_KEYS)), inline=True)
-    embed.add_field(name="📊 Daily Limit", value=f"{DAILY_LIMIT} / user", inline=True)
+    embed.add_field(name="📊 Daily Limit", value=f"{DAILY_LIMIT}/user", inline=True)
+    embed.add_field(name="⏱ Cooldown", value=f"{USER_COOLDOWN}s/user", inline=True)
     await ctx.send(embed=embed)
 
 # ================== USAGE ==================
@@ -133,6 +194,22 @@ async def usage(ctx):
         description=f"You have used **{used}/{DAILY_LIMIT}** requests today.",
         color=0xF1C40F
     )
+    await ctx.send(embed=embed)
+
+# ================== CLEAR CONTEXT ==================
+@bot.command()
+async def clearcontext(ctx):
+    USER_MEMORY.pop(ctx.author.id, None)
+    await ctx.send("🧹 **Your AI memory has been cleared.**")
+
+# ================== ANALYTICS ==================
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def analytics(ctx):
+    embed = discord.Embed(title="📈 AI Analytics", color=0x9B59B6)
+    embed.add_field(name="Total Requests", value=str(TOTAL_REQUESTS), inline=True)
+    embed.add_field(name="Unique Users", value=str(len(UNIQUE_USERS)), inline=True)
+    embed.add_field(name="API Keys", value=str(len(ALL_KEYS)), inline=True)
     await ctx.send(embed=embed)
 
 # ================== ADMIN ==================
@@ -156,11 +233,7 @@ async def ask(ctx, *, prompt: str):
 @bot.command()
 async def translate(ctx, *, text: str):
     async with ctx.typing():
-        reply = ask_ai(
-            ctx.author.id,
-            f"Translate the following text to the target language mentioned by the user. If no target language is mentioned, ask politely.\nText: {text}",
-            system="You are a translation assistant."
-        )
+        reply = ask_ai(ctx.author.id, f"Translate this text to the target language mentioned:\n{text}")
         await ctx.send(reply)
 
 @bot.command()
