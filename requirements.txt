@@ -1,5 +1,3 @@
 discord.py
 groq
 flask
-python-dotenv
-aiohttp
