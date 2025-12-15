@@ -1,7 +1,6 @@
 import discord
 from discord.ext import commands
-import os
-import time
+import os, time, base64, requests
 from groq import Groq, RateLimitError
 from keep_alive import keep_alive
 
@@ -9,175 +8,157 @@ from keep_alive import keep_alive
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 KEYS_STRING = os.getenv("GROQ_API_KEYS")
 
-if not DISCORD_TOKEN:
-    raise RuntimeError("❌ DISCORD_TOKEN not set")
-
-if not KEYS_STRING:
-    raise RuntimeError("❌ GROQ_API_KEYS not set")
-
 ALL_KEYS = [k.strip() for k in KEYS_STRING.split(",") if k.strip()]
-if not ALL_KEYS:
-    raise RuntimeError("❌ No valid Groq API keys found")
-
-print(f"✅ Loaded {len(ALL_KEYS)} Groq API keys")
-
-# ================== KEY STATE ==================
 CURRENT_KEY_INDEX = 0
-KEY_COOLDOWNS = {}          # api_key -> retry timestamp
-KEY_RETRY_AFTER = 25        # seconds
+KEY_COOLDOWNS = {}
+KEY_RETRY_AFTER = 25
 
-# ================== STATUS LOCK ==================
-LAST_STATUS_CALL = {}
-STATUS_COOLDOWN = 3  # seconds
+DAILY_LIMIT = 20
+MEMORY_SIZE = 8
 
-# ================== DISCORD SETUP ==================
+AI_CHANNEL_ID = None
+USER_USAGE = {}
+USER_MEMORY = {}
+USER_MODEL = {}
+
+MODEL_FAST = "llama-3.1-8b-instant"
+MODEL_SMART = "llama3-70b-8192"
+
+# ================== DISCORD ==================
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(
-    command_prefix="$",
-    intents=intents,
-    help_command=None
-)
+bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)
 
-# ================== GROQ ROTATION LOGIC ==================
-def ask_groq(prompt, system_instruction=None):
+# ================== AI CORE ==================
+def ask_ai(user_id, prompt, image_url=None):
     global CURRENT_KEY_INDEX
     now = time.time()
 
-    # Check if any key is available
-    available_keys = [
-        k for k in ALL_KEYS
-        if now >= KEY_COOLDOWNS.get(k, 0)
-    ]
+    if USER_USAGE.get(user_id, {"count":0,"time":now})["count"] >= DAILY_LIMIT:
+        return "🚫 Daily AI limit reached (20/day)."
 
-    if not available_keys:
-        wait_time = int(min(KEY_COOLDOWNS.values()) - now)
-        return f"⏳ AI is cooling down. Try again in {max(wait_time, 1)}s."
+    USER_USAGE.setdefault(user_id, {"count":0,"time":now})
+    if now - USER_USAGE[user_id]["time"] > 86400:
+        USER_USAGE[user_id] = {"count":0,"time":now}
+
+    USER_USAGE[user_id]["count"] += 1
+
+    memory = USER_MEMORY.setdefault(user_id, [])
+    memory.append({"role":"user","content":prompt})
+    memory[:] = memory[-MEMORY_SIZE:]
+
+    model = USER_MODEL.get(user_id, MODEL_FAST)
 
     attempts = 0
-    max_attempts = len(ALL_KEYS)
-
-    while attempts < max_attempts:
-        api_key = ALL_KEYS[CURRENT_KEY_INDEX]
-
-        if now < KEY_COOLDOWNS.get(api_key, 0):
-            CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(ALL_KEYS)
-            attempts += 1
+    while attempts < len(ALL_KEYS):
+        key = ALL_KEYS[CURRENT_KEY_INDEX]
+        if now < KEY_COOLDOWNS.get(key,0):
+            CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX+1)%len(ALL_KEYS)
+            attempts+=1
             continue
-
         try:
-            client = Groq(api_key=api_key)
-            completion = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": system_instruction or
-                        "You are a Discord bot. Reply briefly and clearly. Max 3 sentences."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=200
+            client = Groq(api_key=key)
+            messages = [{"role":"system","content":"Be concise, clear, helpful."}] + memory
+            if image_url:
+                img = base64.b64encode(requests.get(image_url).content).decode()
+                messages[-1]["content"] = [
+                    {"type":"text","text":prompt},
+                    {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{img}"}}
+                ]
+            res = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=300
             )
-            return completion.choices[0].message.content
-
+            reply = res.choices[0].message.content
+            memory.append({"role":"assistant","content":reply})
+            return reply
         except RateLimitError:
-            KEY_COOLDOWNS[api_key] = now + KEY_RETRY_AFTER
+            KEY_COOLDOWNS[key]=now+KEY_RETRY_AFTER
+            CURRENT_KEY_INDEX=(CURRENT_KEY_INDEX+1)%len(ALL_KEYS)
+            attempts+=1
+    return "⏳ AI busy. Try again shortly."
 
-        except Exception as e:
-            print(f"⚠️ Key error: {e}")
-            KEY_COOLDOWNS[api_key] = now + KEY_RETRY_AFTER
-
-        CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(ALL_KEYS)
-        attempts += 1
-
-    return "⏳ AI is busy. Please try again shortly."
-
-# ================== UTILS ==================
-async def send_smart(ctx, text):
-    if len(text) <= 2000:
-        await ctx.send(text)
-    else:
-        for i in range(0, len(text), 1900):
-            await ctx.send(text[i:i+1900])
+# ================== CHECK CHANNEL ==================
+async def channel_check(ctx):
+    if AI_CHANNEL_ID and ctx.channel.id != AI_CHANNEL_ID:
+        return False
+    return True
 
 # ================== EVENTS ==================
 @bot.event
 async def on_ready():
-    print(f"⚡ CONNECTED: {bot.user}")
-    await bot.change_presence(
-        activity=discord.Activity(
-            type=discord.ActivityType.listening,
-            name="$help"
-        )
-    )
+    print(f"⚡ Connected as {bot.user}")
 
-# ================== COMMANDS ==================
-@bot.command(name="help")
-async def help_cmd(ctx):
-    embed = discord.Embed(title="🤖 Learn AI", color=0xf55525)
-    embed.add_field(
-        name="AI",
-        value="`$ask <question>`\n`$explain <topic>`\n`$summary <text>`",
-        inline=False
-    )
-    embed.add_field(name="Fun", value="`$roast @user`", inline=False)
+# ================== HELP ==================
+@bot.command()
+async def help(ctx):
+    embed = discord.Embed(title="🤖 Learn AI Commands", color=0x00ffcc)
+    embed.add_field(name="AI", value="`$ask`\n`$translate`\n`$rewrite`\n`$fixgrammar`\n`$model`\n`$usage`", inline=False)
+    if ctx.author.guild_permissions.administrator:
+        embed.add_field(name="Admin", value="`$setaichannel`", inline=False)
     await ctx.send(embed=embed)
 
-@bot.command(name="ping")
-async def ping(ctx):
-    await ctx.send(f"🏓 Pong! `{round(bot.latency * 1000)}ms`")
-
-@bot.command(name="status")
+# ================== STATUS ==================
+@bot.command()
 async def status(ctx):
-    uid = ctx.author.id
-    now = time.time()
-
-    if now - LAST_STATUS_CALL.get(uid, 0) < STATUS_COOLDOWN:
-        return
-
-    LAST_STATUS_CALL[uid] = now
     await ctx.send(
-        f"🟢 **Online** | Active Key: `#{CURRENT_KEY_INDEX + 1}` of `{len(ALL_KEYS)}`"
+        f"🟢 Online\n"
+        f"🧠 Memory: {MEMORY_SIZE}\n"
+        f"📍 AI Channel: {'Not set' if not AI_CHANNEL_ID else f'<#{AI_CHANNEL_ID}>'}\n"
+        f"⚡ Models: fast/smart\n"
+        f"🔑 Keys: {len(ALL_KEYS)}\n"
+        f"📊 Daily limit: {DAILY_LIMIT}"
     )
 
-@bot.command(name="ask")
-async def ask(ctx, *, prompt: str = ""):
-    if not prompt:
-        await ctx.send("Usage: `$ask <question>`")
+# ================== ADMIN ==================
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setaichannel(ctx, channel: discord.TextChannel):
+    global AI_CHANNEL_ID
+    AI_CHANNEL_ID = channel.id
+    await ctx.send(f"✅ AI locked to {channel.mention}")
+
+# ================== USER ==================
+@bot.command()
+async def usage(ctx):
+    used = USER_USAGE.get(ctx.author.id,{"count":0})["count"]
+    await ctx.send(f"📊 You used `{used}/{DAILY_LIMIT}` AI requests today.")
+
+@bot.command()
+async def model(ctx, mode: str):
+    if mode not in ["fast","smart"]:
+        await ctx.send("Use `fast` or `smart`")
         return
-    async with ctx.typing():
-        answer = ask_groq(prompt)
-        await send_smart(ctx, answer)
+    USER_MODEL[ctx.author.id] = MODEL_FAST if mode=="fast" else MODEL_SMART
+    await ctx.send(f"⚡ Model set to `{mode}`")
 
-@bot.command(name="explain")
-async def explain(ctx, *, topic: str):
+@bot.command()
+async def ask(ctx, *, prompt: str):
+    if not await channel_check(ctx):
+        return
+    img = ctx.message.attachments[0].url if ctx.message.attachments else None
     async with ctx.typing():
-        answer = ask_groq(
-            f"Explain {topic}",
-            system_instruction="Explain simply in 2 sentences."
-        )
-        await send_smart(ctx, f"🎓 **{topic}:**\n{answer}")
+        reply = ask_ai(ctx.author.id, prompt, img)
+        await ctx.send(reply[:2000])
 
-@bot.command(name="summary")
-async def summary(ctx, *, text: str):
+@bot.command()
+async def translate(ctx, *, text: str):
     async with ctx.typing():
-        answer = ask_groq(
-            f"Summarize:\n{text}",
-            system_instruction="Summarize into 3 short bullet points."
-        )
-        await send_smart(ctx, answer)
+        reply = ask_ai(ctx.author.id, f"Translate this to simple Hindi: {text}")
+        await ctx.send(reply)
 
-@bot.command(name="roast")
-async def roast(ctx, member: discord.Member = None):
-    target = member or ctx.author
+@bot.command()
+async def rewrite(ctx, *, text: str):
     async with ctx.typing():
-        answer = ask_groq(
-            f"Roast {target.name}",
-            system_instruction="One short, funny roast."
-        )
-        await ctx.send(f"🔥 {target.mention} {answer}")
+        reply = ask_ai(ctx.author.id, f"Rewrite this professionally: {text}")
+        await ctx.send(reply)
+
+@bot.command()
+async def fixgrammar(ctx, *, text: str):
+    async with ctx.typing():
+        reply = ask_ai(ctx.author.id, f"Fix grammar and improve clarity: {text}")
+        await ctx.send(reply)
 
 # ================== RUN ==================
 keep_alive()
