@@ -9,17 +9,24 @@ from keep_alive import keep_alive
 # --- CONFIGURATION ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# LOAD KEYS: Expects "gsk_1,gsk_2,gsk_3" (Comma separated, no spaces)
+# --- LOAD KEYS (ROBUST METHOD) ---
+# Check for PLURAL name first
 keys_string = os.getenv("GROQ_API_KEYS")
+
+# If plural is missing, try SINGULAR name
 if not keys_string:
-    print("❌ CRITICAL ERROR: GROQ_API_KEYS is missing in Environment!")
+    keys_string = os.getenv("GROQ_API_KEY")
+
+if not keys_string:
+    print("❌ CRITICAL ERROR: No Groq Keys found! Check your Environment Variables.")
     ALL_KEYS = []
 else:
+    # Split by comma and remove spaces
     ALL_KEYS = [k.strip() for k in keys_string.split(',') if k.strip()]
 
-print(f"✅ Loaded {len(ALL_KEYS)} Groq Keys. Cycle Mode Active.")
+print(f"✅ Loaded {len(ALL_KEYS)} Groq Keys.")
 
-# GLOBAL INDEX: Remembers which key we are currently using
+# GLOBAL INDEX
 CURRENT_KEY_INDEX = 0
 
 # --- DISCORD SETUP ---
@@ -31,8 +38,9 @@ bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)
 def ask_groq_cycle(prompt, system_instruction=None):
     global CURRENT_KEY_INDEX
     
-    # We allow the bot to try a full cycle of keys (Length of list)
-    # If we have 4 keys, it tries 4 times max before giving up.
+    if not ALL_KEYS:
+        return "❌ Error: No API Keys configured. Please check Render settings."
+
     attempts = 0
     max_attempts = len(ALL_KEYS)
 
@@ -59,18 +67,15 @@ def ask_groq_cycle(prompt, system_instruction=None):
                 stop=None,
                 stream=False
             )
-            # If successful, we stay on this key (Index doesn't change)
             return completion.choices[0].message.content
 
         except RateLimitError:
             print(f"⚠️ Key #{CURRENT_KEY_INDEX+1} is out of fuel. Rotating...")
-            # Move index to next key (Wraps around: 1->2->3->4->1)
             CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(ALL_KEYS)
             attempts += 1
             
         except Exception as e:
             print(f"⚠️ Key #{CURRENT_KEY_INDEX+1} Error: {e}. Rotating...")
-            # Rotate on other errors too, just in case
             CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(ALL_KEYS)
             attempts += 1
 
@@ -88,12 +93,12 @@ async def send_smart(ctx, text):
 
 @bot.event
 async def on_ready():
-    print(f'⚡ CONNECTED (CYCLE MODE): {bot.user}')
+    print(f'⚡ CONNECTED: {bot.user}')
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="$help"))
 
 @bot.command(name="help")
 async def help_cmd(ctx):
-    embed = discord.Embed(title="🤖 Bot Menu (Infinite Cycle)", color=0xf55525)
+    embed = discord.Embed(title="🤖 Bot Menu", color=0xf55525)
     embed.add_field(name="AI", value="`$ask`\n`$explain`\n`$summary`", inline=False)
     embed.add_field(name="Fun", value="`$imagine`\n`$roast`", inline=False)
     await ctx.send(embed=embed)
@@ -104,7 +109,6 @@ async def ping(ctx):
 
 @bot.command(name="status")
 async def status(ctx):
-    # Shows which key # is currently active
     await ctx.send(f"🟢 **Online** | Active Key: `#{CURRENT_KEY_INDEX + 1}` of `{len(ALL_KEYS)}`")
 
 @bot.command(name="ask")
