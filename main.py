@@ -131,7 +131,43 @@ def ask_ai(user_id, prompt):
 async def on_ready():
     print(f"⚡ Connected as {bot.user}")
 
-# ================= COMMANDS =================
+# ================= HELP / COMMANDS =================
+@bot.command(name="commands", aliases=["help"])
+async def commands_list(ctx):
+    embed = discord.Embed(
+        title="🤖 Learn AI – Commands",
+        description="Smart AI assistant with fast & accurate replies.",
+        color=0x00C2FF
+    )
+
+    embed.add_field(
+        name="🧠 AI",
+        value=(
+            "`$ask <question>` – Ask anything\n"
+            "`$translate <text>` – Translate between any languages\n"
+            "`$rewrite <text>` – Rewrite professionally\n"
+            "`$fixgrammar <text>` – Fix grammar & clarity\n"
+            "`$clearcontext` – Clear your AI memory"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📊 Info",
+        value="`$usage` – Your daily usage\n`$status` – Bot status\n`$ping` – Latency",
+        inline=False
+    )
+
+    if ctx.author.guild_permissions.administrator:
+        embed.add_field(
+            name="🔐 Admin",
+            value="`$setaichannel #channel`\n`$analytics`",
+            inline=False
+        )
+
+    await ctx.send(embed=embed)
+
+# ================= USER COMMANDS =================
 @bot.command()
 async def ask(ctx, *, prompt: str):
     if AI_CHANNEL_ID and ctx.channel.id != AI_CHANNEL_ID:
